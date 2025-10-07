@@ -1,0 +1,19 @@
+# Core dependencies
+requests>=2.31.0
+websockets>=12.0
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Database
+sqlite3  # Built-in with Python
+
+# Async support
+asyncio  # Built-in with Python
+
+# Logging
+python-json-logger>=2.0.7
+
+# Optional: For backtesting visualization
+matplotlib>=3.7.0
