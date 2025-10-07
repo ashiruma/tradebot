@@ -1,414 +1,366 @@
 """
-Order Execution Engine - Places and manages orders with slippage protection
-Handles limit/market orders, order tracking, and execution monitoring
+order_executor.py - Hardened order execution module with state machine, reconciler, and retry logic.
+
+Drop this into your repo to replace the existing order_executor. It expects:
+- an ExchangeAdapter instance (see comments below)
+- a DB module with the following functions (or adapt them):
+    save_order(order_dict)
+    update_order(order_id, fields_dict)
+    fetch_open_orders_db()
+    fetch_orders_by_status(status)
+    record_fill(order_id, fill)
+    get_recent_trades(since_ts)
+- a logger module with logger.info / logger.error / logger.debug
+- config flags: DRY_RUN, ENABLE_TRADING, MAX_RETRIES, etc. (see config.example.py)
 """
 
+from __future__ import annotations
+import threading
 import time
-from typing import Dict, Optional, Tuple
-from datetime import datetime
-from okx_client import OKXClient
-from config import (
-    MAX_SLIPPAGE,
-    ORDER_TIMEOUT,
-    USE_LIMIT_ORDERS,
-    DRY_RUN,
-    ENABLE_TRADING
-)
+import uuid
+import math
+from dataclasses import dataclass, field, asdict
+from enum import Enum, auto
+from typing import Optional, Dict, Any, List, Callable
+import os
+
+# Local imports - adjust to your project layout
+import logger  # simple wrapper around logging (your logger.py)
+import database  # your database interface (database.py)
+import config  # your config module (use config.example.py pattern)
+
+# ---------- Configuration & defaults ----------
+MAX_SUBMIT_RETRIES = getattr(config, "ORDER_SUBMIT_MAX_RETRIES", 5)
+INITIAL_BACKOFF = getattr(config, "ORDER_SUBMIT_BACKOFF", 0.5)  # seconds
+MAX_BACKOFF = getattr(config, "ORDER_SUBMIT_MAX_BACKOFF", 10.0)
+RECONCILE_WINDOW_SECONDS = getattr(config, "RECONCILE_WINDOW_SECONDS", 60 * 60 * 24)  # 24h by default
+
+# Respect master switches
+DRY_RUN = getattr(config, "DRY_RUN", True)
+ENABLE_TRADING = getattr(config, "ENABLE_TRADING", False)  # extra safety: must be True to place live orders
+
+# ---------- Order state machine ----------
+class OrderStatus(Enum):
+    NEW = auto()         # internal initial
+    SUBMITTED = auto()   # placed to exchange, waiting fills
+    PARTIAL = auto()     # partially filled
+    FILLED = auto()      # fully filled
+    CANCELLED = auto()   # cancelled by us / exchange
+    REJECTED = auto()    # rejected by exchange
+    FAILED = auto()      # failed after retries
+
+@dataclass
+class ManagedOrder:
+    """
+    Dataclass used for internal representation (and for DB serialization).
+    """
+    client_oid: str
+    symbol: str
+    side: str  # "buy" or "sell"
+    qty: float
+    price: Optional[float] = None  # None for market orders
+    order_type: str = "market"  # "market" or "limit"
+    status: OrderStatus = OrderStatus.NEW
+    filled_qty: float = 0.0
+    exchange_order_id: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    meta: Dict[str, Any] = field(default_factory=dict)  # free-form for tests, tags, strategy id, etc.
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.name
+        return d
 
 
+# ---------- Helper functions ----------
+def _generate_client_oid(prefix: str = "mbg") -> str:
+    """Create idempotent client order id; callers may pass their own client_oid."""
+    return f"{prefix}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+
+# Exponential backoff helper
+def _backoff_retry(func: Callable, max_retries=MAX_SUBMIT_RETRIES, initial_delay=INITIAL_BACKOFF, max_delay=MAX_BACKOFF, retry_on=Exception, *args, **kwargs):
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except retry_on as e:
+            logger.logger.warning(f"Transient error on attempt {attempt}/{max_retries}: {e}")
+            if attempt == max_retries:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+
+# ---------- Core OrderExecutor class ----------
 class OrderExecutor:
-    """Manages order placement and execution"""
-    
-    def __init__(self, client: OKXClient):
-        self.client = client
-        self.pending_orders: Dict[str, Dict] = {}
-        self.filled_orders: Dict[str, Dict] = {}
-        self.order_history: list = []
-        
-    def calculate_limit_price(self, side: str, current_price: float, slippage_pct: float = MAX_SLIPPAGE) -> float:
-        """Calculate limit price with slippage buffer
-        
-        Args:
-            side: 'buy' or 'sell'
-            current_price: Current market price
-            slippage_pct: Maximum slippage tolerance
-        
-        Returns:
-            Limit price
-        """
-        if side == "buy":
-            # For buys, add slippage (willing to pay slightly more)
-            limit_price = current_price * (1 + slippage_pct)
-        else:
-            # For sells, subtract slippage (willing to accept slightly less)
-            limit_price = current_price * (1 - slippage_pct)
-        
-        return limit_price
-    
-    def validate_order_params(self, inst_id: str, side: str, quantity: float, price: Optional[float] = None) -> Tuple[bool, str]:
-        """Validate order parameters before submission
-        
-        Returns:
-            (is_valid, reason)
-        """
-        # Check side
-        if side not in ["buy", "sell"]:
-            return False, f"Invalid side: {side}"
-        
-        # Check quantity
-        if quantity <= 0:
-            return False, "Quantity must be positive"
-        
-        # Check price for limit orders
-        if USE_LIMIT_ORDERS and price is None:
-            return False, "Price required for limit orders"
-        
-        if price is not None and price <= 0:
-            return False, "Price must be positive"
-        
-        return True, "OK"
-    
-    def place_order(self, inst_id: str, side: str, quantity: float, current_price: float, order_type: str = None) -> Dict:
-        """Place an order on OKX
-        
-        Args:
-            inst_id: Trading pair (e.g., BTC-USDT)
-            side: 'buy' or 'sell'
-            quantity: Order quantity in base currency
-            current_price: Current market price
-            order_type: 'limit' or 'market' (overrides config)
-        
-        Returns:
-            Order result dict
-        """
-        # Determine order type
-        if order_type is None:
-            order_type = "limit" if USE_LIMIT_ORDERS else "market"
-        
-        # Calculate limit price if needed
-        limit_price = None
-        if order_type == "limit":
-            limit_price = self.calculate_limit_price(side, current_price)
-        
-        # Validate parameters
-        is_valid, reason = self.validate_order_params(inst_id, side, quantity, limit_price)
-        if not is_valid:
-            print(f"[v0] Order validation failed: {reason}")
-            return {"status": "FAILED", "reason": reason}
-        
-        # Generate client order ID
-        client_order_id = f"{inst_id.replace('-', '')}_{int(time.time() * 1000)}"
-        
-        # Create order record
-        order = {
-            "client_order_id": client_order_id,
-            "inst_id": inst_id,
-            "side": side,
-            "order_type": order_type,
-            "quantity": quantity,
-            "limit_price": limit_price,
-            "current_price": current_price,
-            "status": "PENDING",
-            "submit_time": datetime.now().isoformat(),
-            "order_id": None,
-            "filled_price": None,
-            "filled_quantity": None
-        }
-        
-        # Check if trading is enabled
-        if not ENABLE_TRADING or DRY_RUN:
-            print(f"[v0] DRY RUN - Order not submitted (ENABLE_TRADING={ENABLE_TRADING}, DRY_RUN={DRY_RUN})")
-            print(f"     {side.upper()} {quantity:.6f} {inst_id} @ ${limit_price or current_price:.2f}")
-            order["status"] = "DRY_RUN"
-            order["order_id"] = client_order_id
-            self.order_history.append(order)
-            return order
-        
-        # Submit order to OKX
-        try:
-            print(f"[v0] Submitting {order_type} {side} order for {inst_id}...")
-            print(f"     Quantity: {quantity:.6f}")
-            if limit_price:
-                print(f"     Limit price: ${limit_price:.2f}")
-            
-            response = self.client.place_order(
-                inst_id=inst_id,
-                side=side,
-                order_type=order_type,
-                size=str(quantity),
-                price=str(limit_price) if limit_price else None,
-                client_order_id=client_order_id
-            )
-            
-            # Check response
-            if response.get("code") == "0" and response.get("data"):
-                order_data = response["data"][0]
-                order["order_id"] = order_data.get("ordId")
-                order["status"] = "SUBMITTED"
-                
-                print(f"[v0] Order submitted successfully!")
-                print(f"     Order ID: {order['order_id']}")
-                
-                # Track pending order
-                self.pending_orders[order["order_id"]] = order
-                self.order_history.append(order)
-                
-                return order
-            else:
-                # Order failed
-                error_msg = response.get("msg", "Unknown error")
-                print(f"[v0] Order submission failed: {error_msg}")
-                order["status"] = "FAILED"
-                order["error"] = error_msg
-                self.order_history.append(order)
-                return order
-                
-        except Exception as e:
-            print(f"[v0] Exception during order submission: {e}")
-            order["status"] = "FAILED"
-            order["error"] = str(e)
-            self.order_history.append(order)
-            return order
-    
-    def check_order_status(self, order_id: str, inst_id: str) -> Dict:
-        """Check the status of an order
-        
-        Returns:
-            Order status dict
-        """
-        if DRY_RUN or not ENABLE_TRADING:
-            # In dry run, simulate immediate fill
-            if order_id in self.pending_orders:
-                order = self.pending_orders[order_id]
-                return {
-                    "order_id": order_id,
-                    "status": "FILLED",
-                    "filled_price": order.get("limit_price") or order.get("current_price"),
-                    "filled_quantity": order["quantity"]
-                }
-            return {"order_id": order_id, "status": "UNKNOWN"}
-        
-        try:
-            response = self.client.get_order(inst_id, order_id)
-            
-            if response.get("code") == "0" and response.get("data"):
-                order_data = response["data"][0]
-                
-                status_map = {
-                    "live": "PENDING",
-                    "partially_filled": "PARTIAL",
-                    "filled": "FILLED",
-                    "canceled": "CANCELED",
-                    "mmp_canceled": "CANCELED"
-                }
-                
-                okx_status = order_data.get("state", "")
-                status = status_map.get(okx_status, "UNKNOWN")
-                
-                return {
-                    "order_id": order_id,
-                    "status": status,
-                    "filled_price": float(order_data.get("avgPx", 0)) if order_data.get("avgPx") else None,
-                    "filled_quantity": float(order_data.get("accFillSz", 0)),
-                    "remaining_quantity": float(order_data.get("sz", 0)) - float(order_data.get("accFillSz", 0))
-                }
-            else:
-                return {"order_id": order_id, "status": "ERROR", "error": response.get("msg")}
-                
-        except Exception as e:
-            print(f"[v0] Error checking order status: {e}")
-            return {"order_id": order_id, "status": "ERROR", "error": str(e)}
-    
-    def wait_for_fill(self, order_id: str, inst_id: str, timeout: int = ORDER_TIMEOUT) -> Dict:
-        """Wait for order to fill with timeout
-        
-        Returns:
-            Final order status
-        """
-        start_time = time.time()
-        
-        print(f"[v0] Waiting for order {order_id} to fill (timeout: {timeout}s)...")
-        
-        while time.time() - start_time < timeout:
-            status = self.check_order_status(order_id, inst_id)
-            
-            if status["status"] == "FILLED":
-                print(f"[v0] Order filled!")
-                print(f"     Filled price: ${status['filled_price']:.2f}")
-                print(f"     Filled quantity: {status['filled_quantity']:.6f}")
-                
-                # Update order record
-                if order_id in self.pending_orders:
-                    order = self.pending_orders[order_id]
-                    order["status"] = "FILLED"
-                    order["filled_price"] = status["filled_price"]
-                    order["filled_quantity"] = status["filled_quantity"]
-                    order["fill_time"] = datetime.now().isoformat()
-                    
-                    # Move to filled orders
-                    self.filled_orders[order_id] = order
-                    del self.pending_orders[order_id]
-                
-                return status
-            
-            elif status["status"] in ["CANCELED", "ERROR"]:
-                print(f"[v0] Order {status['status']}")
-                return status
-            
-            # Wait before checking again
-            time.sleep(1)
-        
-        # Timeout reached
-        print(f"[v0] Order timeout reached after {timeout}s")
-        
-        # Try to cancel the order
-        self.cancel_order(order_id, inst_id)
-        
-        return {"order_id": order_id, "status": "TIMEOUT"}
-    
-    def cancel_order(self, order_id: str, inst_id: str) -> bool:
-        """Cancel an order
-        
-        Returns:
-            True if canceled successfully
-        """
-        if DRY_RUN or not ENABLE_TRADING:
-            print(f"[v0] DRY RUN - Order cancel simulated")
-            return True
-        
-        try:
-            print(f"[v0] Canceling order {order_id}...")
-            response = self.client.cancel_order(inst_id, order_id)
-            
-            if response.get("code") == "0":
-                print(f"[v0] Order canceled successfully")
-                
-                # Update order record
-                if order_id in self.pending_orders:
-                    order = self.pending_orders[order_id]
-                    order["status"] = "CANCELED"
-                    order["cancel_time"] = datetime.now().isoformat()
-                    del self.pending_orders[order_id]
-                
-                return True
-            else:
-                print(f"[v0] Cancel failed: {response.get('msg')}")
-                return False
-                
-        except Exception as e:
-            print(f"[v0] Exception during cancel: {e}")
-            return False
-    
-    def execute_buy(self, inst_id: str, quantity: float, current_price: float) -> Optional[Dict]:
-        """Execute a buy order and wait for fill
-        
-        Returns:
-            Filled order dict or None if failed
-        """
-        print(f"\n[v0] Executing BUY order for {inst_id}")
-        
-        # Place order
-        order = self.place_order(inst_id, "buy", quantity, current_price)
-        
-        if order["status"] in ["FAILED", "ERROR"]:
-            return None
-        
-        # For dry run, return immediately
-        if order["status"] == "DRY_RUN":
-            order["filled_price"] = order.get("limit_price") or current_price
-            order["filled_quantity"] = quantity
-            return order
-        
-        # Wait for fill
-        order_id = order["order_id"]
-        result = self.wait_for_fill(order_id, inst_id)
-        
-        if result["status"] == "FILLED":
-            return self.filled_orders.get(order_id)
-        
-        return None
-    
-    def execute_sell(self, inst_id: str, quantity: float, current_price: float) -> Optional[Dict]:
-        """Execute a sell order and wait for fill
-        
-        Returns:
-            Filled order dict or None if failed
-        """
-        print(f"\n[v0] Executing SELL order for {inst_id}")
-        
-        # Place order
-        order = self.place_order(inst_id, "sell", quantity, current_price)
-        
-        if order["status"] in ["FAILED", "ERROR"]:
-            return None
-        
-        # For dry run, return immediately
-        if order["status"] == "DRY_RUN":
-            order["filled_price"] = order.get("limit_price") or current_price
-            order["filled_quantity"] = quantity
-            return order
-        
-        # Wait for fill
-        order_id = order["order_id"]
-        result = self.wait_for_fill(order_id, inst_id)
-        
-        if result["status"] == "FILLED":
-            return self.filled_orders.get(order_id)
-        
-        return None
-    
-    def get_order_summary(self) -> Dict:
-        """Get summary of order execution"""
-        return {
-            "total_orders": len(self.order_history),
-            "pending_orders": len(self.pending_orders),
-            "filled_orders": len(self.filled_orders),
-            "order_history": self.order_history[-10:]  # Last 10 orders
-        }
+    """
+    Provides safe order placement, cancel, and reconciliation routines.
+    Must be instantiated with an ExchangeAdapter (your okx_client wrapper) and DB module.
+    """
 
+    def __init__(self, exchange_adapter, db=database, dry_run: bool = DRY_RUN, enable_trading: bool = ENABLE_TRADING):
+        """
+        exchange_adapter: object with methods:
+            - place_order(symbol, side, qty, price=None, client_oid=None, order_type="market")
+              returns dict { "exchange_order_id": str, "status": "submitted" ... } or raises.
+            - cancel_order(order_id_or_client_oid)
+            - get_open_orders() -> list of dicts with keys exchange_order_id, client_oid, status, filled_qty, qty
+            - get_order(order_id_or_client_oid)
+            - get_recent_trades(since_ts)
+        db: your database interface module
+        """
+        self.exchange = exchange_adapter
+        self.db = db
+        self.dry_run = dry_run
+        self.enable_trading = enable_trading
+        self._lock = threading.Lock()  # protect concurrent submissions
+        logger.logger.info("OrderExecutor initialised - dry_run=%s enable_trading=%s", self.dry_run, self.enable_trading)
 
-if __name__ == "__main__":
-    """Test order executor"""
-    print("Testing Order Executor...")
-    print("=" * 60)
-    
-    client = OKXClient()
-    executor = OrderExecutor(client)
-    
-    # Test 1: Calculate limit price
-    print("\n1. Calculating limit prices...")
-    current_price = 50000.0
-    buy_limit = executor.calculate_limit_price("buy", current_price)
-    sell_limit = executor.calculate_limit_price("sell", current_price)
-    print(f"   Current price: ${current_price:,.2f}")
-    print(f"   Buy limit: ${buy_limit:,.2f} (+{MAX_SLIPPAGE:.2%})")
-    print(f"   Sell limit: ${sell_limit:,.2f} (-{MAX_SLIPPAGE:.2%})")
-    
-    # Test 2: Validate order params
-    print("\n2. Validating order parameters...")
-    is_valid, msg = executor.validate_order_params("BTC-USDT", "buy", 0.001, 50000.0)
-    print(f"   Valid: {is_valid} - {msg}")
-    
-    # Test 3: Place dry run order
-    print("\n3. Placing dry run buy order...")
-    order = executor.place_order("BTC-USDT", "buy", 0.001, current_price)
-    print(f"   Order status: {order['status']}")
-    print(f"   Order ID: {order.get('order_id')}")
-    
-    # Test 4: Execute buy (dry run)
-    print("\n4. Executing buy order (dry run)...")
-    filled_order = executor.execute_buy("BTC-USDT", 0.001, current_price)
-    if filled_order:
-        print(f"   Order filled!")
-        print(f"   Filled price: ${filled_order['filled_price']:,.2f}")
-        print(f"   Filled quantity: {filled_order['filled_quantity']:.6f}")
-    
-    # Test 5: Order summary
-    print("\n5. Order summary...")
-    summary = executor.get_order_summary()
-    print(f"   Total orders: {summary['total_orders']}")
-    print(f"   Pending: {summary['pending_orders']}")
-    print(f"   Filled: {summary['filled_orders']}")
-    
-    print("\n" + "=" * 60)
-    print("Order Executor test complete!")
+    # ------------------ Submit order ------------------
+    def submit_order(self, symbol: str, side: str, qty: float, price: Optional[float] = None,
+                     order_type: str = "market", client_oid: Optional[str] = None, meta: Dict[str, Any] = None) -> ManagedOrder:
+        """
+        High-level method for placing an order.
+        - creates ManagedOrder record
+        - persists to DB immediately (status=NEW)
+        - calls exchange adapter with retries
+        - updates DB with exchange_order_id and status
+        """
+        if side.lower() not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+
+        if qty <= 0:
+            raise ValueError("qty must be > 0")
+
+        client_oid = client_oid or _generate_client_oid()
+        meta = meta or {}
+
+        order = ManagedOrder(client_oid=client_oid, symbol=symbol, side=side.lower(), qty=qty,
+                             price=price, order_type=order_type, meta=meta)
+
+        # persist initial order to DB
+        try:
+            self.db.save_order(order.to_dict())
+        except Exception as e:
+            logger.logger.error("Failed to persist new order to DB: %s", e)
+            raise
+
+        logger.logger.info("Placed local order record %s -> %s %s %s@%s", order.client_oid, order.side, order.qty, order.symbol, order.price)
+        if self.dry_run or not self.enable_trading:
+            logger.logger.info("DRY_RUN or trading disabled - not sending to exchange (client_oid=%s)", order.client_oid)
+            order.status = OrderStatus.SUBMITTED
+            order.updated_at = time.time()
+            self.db.update_order(order.client_oid, {"status": order.status.name, "updated_at": order.updated_at})
+            return order
+
+        # Acquire lock to avoid concurrent placement races
+        with self._lock:
+            try:
+                resp = _backoff_retry(self._place_order_once, max_retries=MAX_SUBMIT_RETRIES,
+                                      initial_delay=INITIAL_BACKOFF, max_delay=MAX_BACKOFF,
+                                      retry_on=Exception, order=order)
+            except Exception as e:
+                order.status = OrderStatus.FAILED
+                order.updated_at = time.time()
+                self.db.update_order(order.client_oid, {"status": order.status.name, "updated_at": order.updated_at, "meta": {**order.meta, "error": str(e)}})
+                logger.logger.error("Order submit ultimately failed for %s: %s", order.client_oid, e)
+                raise
+
+            # update local order with exchange id & status
+            order.exchange_order_id = resp.get("exchange_order_id") or resp.get("order_id")
+            order.status = OrderStatus.SUBMITTED
+            order.updated_at = time.time()
+            self.db.update_order(order.client_oid, {"exchange_order_id": order.exchange_order_id, "status": order.status.name, "updated_at": order.updated_at})
+            logger.logger.info("Order submitted to exchange: client_oid=%s exchange_id=%s", order.client_oid, order.exchange_order_id)
+            return order
+
+    def _place_order_once(self, order: ManagedOrder) -> Dict[str, Any]:
+        """
+        Single attempt to place order on exchange. Adapter errors propagate to caller.
+        Adapter must handle rate-limit and translate exchange-specific exceptions.
+        """
+        logger.logger.debug("Submitting order to exchange: %s", order.to_dict())
+        # The adapter API call; adapt args to your exchange wrapper signature
+        resp = self.exchange.place_order(symbol=order.symbol, side=order.side, qty=order.qty,
+                                        price=order.price, client_oid=order.client_oid, order_type=order.order_type)
+        if not isinstance(resp, dict):
+            raise RuntimeError("Exchange adapter returned unexpected response type")
+
+        # Basic validation
+        if "exchange_order_id" not in resp and "order_id" not in resp:
+            # Support some adapters that return {"result": {...}} etc.
+            # Try to extract common fields; if not possible, raise.
+            logger.logger.debug("Raw exchange response: %s", resp)
+            raise RuntimeError("No exchange_order_id in response")
+
+        return resp
+
+    # ------------------ Cancel order ------------------
+    def cancel_order(self, client_oid_or_exchange_id: str) -> Dict[str, Any]:
+        """
+        Cancel by client_oid or exchange id.
+        Updates DB status to CANCELLED on success.
+        """
+        logger.logger.info("Cancel request for %s", client_oid_or_exchange_id)
+        # If dry-run, simulate cancel
+        if self.dry_run or not self.enable_trading:
+            logger.logger.info("DRY_RUN or trading disabled - simulated cancel for %s", client_oid_or_exchange_id)
+            # update DB if present
+            try:
+                self.db.update_order(client_oid_or_exchange_id, {"status": OrderStatus.CANCELLED.name, "updated_at": time.time()})
+            except Exception:
+                # try by exchange id
+                self.db.update_order_by_exchange_id(client_oid_or_exchange_id, {"status": OrderStatus.CANCELLED.name, "updated_at": time.time()})
+            return {"status": "cancelled", "client_oid": client_oid_or_exchange_id}
+
+        try:
+            resp = _backoff_retry(self.exchange.cancel_order, max_retries=3, initial_delay=0.3, retry_on=Exception, order_id_or_client_oid=client_oid_or_exchange_id)
+        except Exception as e:
+            logger.logger.error("Failed to cancel order %s: %s", client_oid_or_exchange_id, e)
+            raise
+
+        # Update DB - adapter should return something we can use, otherwise mark CANCELLED
+        try:
+            self.db.update_order(client_oid_or_exchange_id, {"status": OrderStatus.CANCELLED.name, "updated_at": time.time()})
+        except Exception:
+            # fallback: update by exchange id
+            self.db.update_order_by_exchange_id(client_oid_or_exchange_id, {"status": OrderStatus.CANCELLED.name, "updated_at": time.time()})
+
+        logger.logger.info("Cancel succeeded for %s", client_oid_or_exchange_id)
+        return resp
+
+    # ------------------ Reconciliation on startup ------------------
+    def reconcile_on_startup(self) -> None:
+        """
+        Re-sync local DB with exchange open orders & recent fills.
+        - Fetch exchange open orders and reconcile with DB
+        - For local orders not found on exchange, fetch recent fills/trades and update status if necessary
+        - This is the most important safety routine on startup so the bot doesn't assume it's flat.
+        """
+        logger.logger.info("Starting reconciliation with exchange")
+        # fetch exchange open orders
+        try:
+            exch_open = self.exchange.get_open_orders()
+        except Exception as e:
+            logger.logger.error("Failed to fetch open orders from exchange during reconcile: %s", e)
+            # Don't raise — still allow manual inspection
+            exch_open = []
+
+        # Build maps by client_oid and exchange id for quick lookup
+        exch_by_client = {o.get("client_oid"): o for o in exch_open if o.get("client_oid")}
+        exch_by_id = {o.get("exchange_order_id") or o.get("order_id"): o for o in exch_open}
+
+        # Reconcile DB open orders
+        db_open_orders = self.db.fetch_open_orders_db()
+        for db_o in db_open_orders:
+            client_oid = db_o.get("client_oid")
+            exch_id = db_o.get("exchange_order_id")
+            logger.logger.debug("Reconciling local order %s / exch_id=%s", client_oid, exch_id)
+
+            # If exchange reports it as open, update local record to SUBMITTED
+            if client_oid in exch_by_client or (exch_id and exch_id in exch_by_id):
+                # update DB with latest fields from exchange
+                exch_rec = exch_by_client.get(client_oid) or exch_by_id.get(exch_id)
+                self.db.update_order(client_oid, {
+                    "status": OrderStatus.SUBMITTED.name,
+                    "filled_qty": exch_rec.get("filled_qty", db_o.get("filled_qty", 0)),
+                    "exchange_order_id": exch_rec.get("exchange_order_id") or exch_rec.get("order_id"),
+                    "updated_at": time.time()
+                })
+                logger.logger.debug("Order %s exists on exchange and marked SUBMITTED", client_oid)
+            else:
+                # Not on exchange open list -> order may be filled, cancelled or failed. Query recent trades / history
+                logger.logger.debug("Order %s not found in exchange open list. Checking recent trades.", client_oid)
+                try:
+                    recent_trades = self.exchange.get_recent_trades(RECONCILE_WINDOW_SECONDS)
+                except Exception as e:
+                    logger.logger.warning("Could not fetch recent trades during reconcile: %s", e)
+                    recent_trades = []
+
+                # Try to find fills for this client_oid
+                matched_fill = None
+                for t in recent_trades:
+                    if t.get("client_oid") == client_oid or t.get("order_id") == exch_id:
+                        matched_fill = t
+                        break
+
+                if matched_fill:
+                    # record fill & mark FILLED or PARTIAL depending on filled qty
+                    filled_qty = matched_fill.get("filled_qty", matched_fill.get("qty", 0))
+                    total_qty = db_o.get("qty")
+                    new_status = OrderStatus.FILLED if math.isclose(filled_qty, total_qty) or filled_qty >= total_qty else OrderStatus.PARTIAL
+                    self.db.record_fill(db_o.get("client_oid"), {"filled_qty": filled_qty, "price": matched_fill.get("price"), "timestamp": matched_fill.get("timestamp")})
+                    self.db.update_order(db_o.get("client_oid"), {"status": new_status.name, "filled_qty": filled_qty, "updated_at": time.time()})
+                    logger.logger.info("Order %s reconciled from trades as %s", client_oid, new_status.name)
+                else:
+                    # No trace: be conservative and mark CANCELLED if age > threshold or leave SUBMITTED for manual review
+                    age_seconds = time.time() - (db_o.get("created_at") or 0)
+                    if age_seconds > (60 * 60 * 24):  # older than 24h
+                        self.db.update_order(client_oid, {"status": OrderStatus.CANCELLED.name, "updated_at": time.time()})
+                        logger.logger.info("Order %s not found and older than 24h - marking CANCELLED", client_oid)
+                    else:
+                        logger.logger.warning("Order %s not found on exchange, younger than 24h - leaving for manual review", client_oid)
+
+        logger.logger.info("Reconciliation complete")
+
+    # ------------------ Handle exchange order updates (websocket callbacks) ------------------
+    def handle_exchange_update(self, update: Dict[str, Any]) -> None:
+        """
+        Called by your websocket/adapter when an order update arrives.
+        Expected update fields: client_oid, exchange_order_id, status, filled_qty, qty, price
+        """
+        client_oid = update.get("client_oid")
+        exchange_order_id = update.get("exchange_order_id") or update.get("order_id")
+        status_text = update.get("status")
+        filled_qty = float(update.get("filled_qty", 0))
+        logger.logger.debug("Exchange order update: %s", update)
+
+        # Map exchange status strings to our OrderStatus
+        status_map = {
+            "filled": OrderStatus.FILLED,
+            "cancelled": OrderStatus.CANCELLED,
+            "canceled": OrderStatus.CANCELLED,
+            "partial_filled": OrderStatus.PARTIAL,
+            "partial": OrderStatus.PARTIAL,
+            "submitted": OrderStatus.SUBMITTED,
+            "open": OrderStatus.SUBMITTED,
+            "rejected": OrderStatus.REJECTED,
+        }
+        mapped_status = status_map.get(status_text.lower(), None) if status_text else None
+
+        # If we receive updates without client_oid, try exchange id lookup in DB
+        if not client_oid:
+            db_lookup = self.db.fetch_order_by_exchange_id(exchange_order_id)
+            client_oid = db_lookup.get("client_oid") if db_lookup else None
+
+        if not client_oid:
+            logger.logger.warning("Received order update with no matching client_oid and no DB match: %s", update)
+            return
+
+        # Update DB with new info
+        update_fields = {"exchange_order_id": exchange_order_id, "filled_qty": filled_qty, "updated_at": time.time()}
+        if mapped_status:
+            update_fields["status"] = mapped_status.name
+
+        # record fill events if present
+        if filled_qty and filled_qty > 0:
+            try:
+                self.db.record_fill(client_oid, {"filled_qty": filled_qty, "price": update.get("price"), "timestamp": update.get("timestamp", time.time())})
+            except Exception as e:
+                logger.logger.warning("Failed to record fill in DB for %s: %s", client_oid, e)
+
+        try:
+            self.db.update_order(client_oid, update_fields)
+            logger.logger.info("Order %s updated to %s (filled=%s)", client_oid, update_fields.get("status"), filled_qty)
+        except Exception as e:
+            logger.logger.error("Failed to update DB for order %s: %s", client_oid, e)
+
+    # ------------------ Utility: fetch order status ------------------
+    def get_local_order(self, client_oid: str) -> Optional[Dict[str, Any]]:
+        """Return local DB order by client_oid."""
+        return self.db.fetch_order(client_oid)
+
+    def list_open_local_orders(self) -> List[Dict[str, Any]]:
+        return self.db.fetch_open_orders_db()
