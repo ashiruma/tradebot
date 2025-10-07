@@ -21,7 +21,11 @@ from config import (
     OKX_WS_PUBLIC_URL,
     OKX_WS_PRIVATE_URL,
     OKX_SIMULATED,
-    API_RATE_LIMIT
+    API_RATE_LIMIT,
+    MAX_API_RETRIES,
+    RETRY_DELAY,
+    WS_RECONNECT_DELAY,
+    MAX_WS_RECONNECT_ATTEMPTS
 )
 
 
@@ -83,26 +87,70 @@ class OKXClient:
         self.request_times.append(now)
     
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, data: Optional[Dict] = None) -> Dict:
-        """Make authenticated API request with rate limiting"""
-        self._rate_limit_check()
+        """Make authenticated API request with rate limiting and retries"""
+        last_error = None
         
-        url = f"{self.base_url}{endpoint}"
-        body = json.dumps(data) if data else ""
-        headers = self._get_headers(method, endpoint, body)
-        
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, params=params, timeout=10)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=data, timeout=10)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+        for attempt in range(MAX_API_RETRIES):
+            try:
+                self._rate_limit_check()
+                
+                url = f"{self.base_url}{endpoint}"
+                body = json.dumps(data) if data else ""
+                headers = self._get_headers(method, endpoint, body)
+                
+                if method == "GET":
+                    response = requests.get(url, headers=headers, params=params, timeout=10)
+                elif method == "POST":
+                    response = requests.post(url, headers=headers, json=data, timeout=10)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+                
+                response.raise_for_status()
+                result = response.json()
+                
+                # Check OKX API error codes
+                if result.get("code") != "0":
+                    error_msg = result.get("msg", "Unknown error")
+                    print(f"[v0] OKX API error: {error_msg}")
+                    
+                    # Don't retry certain errors (invalid params, insufficient balance, etc.)
+                    non_retryable_codes = ["51000", "51001", "51008", "51020"]
+                    if result.get("code") in non_retryable_codes:
+                        return result
+                    
+                    # Retry for other errors
+                    last_error = error_msg
+                    if attempt < MAX_API_RETRIES - 1:
+                        print(f"[v0] Retrying in {RETRY_DELAY}s... (attempt {attempt + 1}/{MAX_API_RETRIES})")
+                        time.sleep(RETRY_DELAY)
+                        continue
+                
+                return result
+                
+            except requests.exceptions.Timeout as e:
+                last_error = f"Request timeout: {e}"
+                print(f"[v0] {last_error}")
+                
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                print(f"[v0] {last_error}")
+                
+            except requests.exceptions.HTTPError as e:
+                last_error = f"HTTP error: {e}"
+                print(f"[v0] {last_error}")
+                
+            except Exception as e:
+                last_error = f"Unexpected error: {e}"
+                print(f"[v0] {last_error}")
             
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"[v0] API request error: {e}")
-            return {"code": "error", "msg": str(e)}
+            # Wait before retry
+            if attempt < MAX_API_RETRIES - 1:
+                print(f"[v0] Retrying in {RETRY_DELAY}s... (attempt {attempt + 1}/{MAX_API_RETRIES})")
+                time.sleep(RETRY_DELAY)
+        
+        # All retries failed
+        print(f"[v0] API request failed after {MAX_API_RETRIES} attempts: {last_error}")
+        return {"code": "error", "msg": last_error}
     
     # ========================================================================
     # MARKET DATA ENDPOINTS
@@ -251,19 +299,41 @@ class OKXWebSocket:
         self.url = url
         self.ws = None
         self.subscriptions = []
+        self.reconnect_attempts = 0
+        self.is_connected = False
         
     async def connect(self):
-        """Establish WebSocket connection"""
-        self.ws = await websockets.connect(self.url)
-        print(f"[v0] WebSocket connected to {self.url}")
-    
-    async def subscribe(self, channel: str, inst_id: str):
-        """Subscribe to a channel
+        """Establish WebSocket connection with retry logic"""
+        while self.reconnect_attempts < MAX_WS_RECONNECT_ATTEMPTS:
+            try:
+                self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=10)
+                self.is_connected = True
+                self.reconnect_attempts = 0
+                print(f"[v0] WebSocket connected to {self.url}")
+                
+                # Resubscribe to channels after reconnection
+                if self.subscriptions:
+                    print(f"[v0] Resubscribing to {len(self.subscriptions)} channels...")
+                    for sub in self.subscriptions:
+                        await self._send_subscribe(sub["channel"], sub["instId"])
+                
+                return True
+                
+            except Exception as e:
+                self.reconnect_attempts += 1
+                print(f"[v0] WebSocket connection failed (attempt {self.reconnect_attempts}/{MAX_WS_RECONNECT_ATTEMPTS}): {e}")
+                
+                if self.reconnect_attempts < MAX_WS_RECONNECT_ATTEMPTS:
+                    print(f"[v0] Retrying in {WS_RECONNECT_DELAY}s...")
+                    await asyncio.sleep(WS_RECONNECT_DELAY)
+                else:
+                    print(f"[v0] Max reconnection attempts reached")
+                    return False
         
-        Args:
-            channel: Channel name (e.g., 'tickers', 'candle1H', 'books')
-            inst_id: Trading pair (e.g., BTC-USDT)
-        """
+        return False
+    
+    async def _send_subscribe(self, channel: str, inst_id: str):
+        """Send subscription message"""
         sub_msg = {
             "op": "subscribe",
             "args": [{
@@ -272,18 +342,36 @@ class OKXWebSocket:
             }]
         }
         await self.ws.send(json.dumps(sub_msg))
+    
+    async def subscribe(self, channel: str, inst_id: str):
+        """Subscribe to a channel
+        
+        Args:
+            channel: Channel name (e.g., 'tickers', 'candle1H', 'books')
+            inst_id: Trading pair (e.g., BTC-USDT)
+        """
+        await self._send_subscribe(channel, inst_id)
         self.subscriptions.append({"channel": channel, "instId": inst_id})
         print(f"[v0] Subscribed to {channel} for {inst_id}")
     
-    async def receive(self) -> Dict:
-        """Receive message from WebSocket"""
-        message = await self.ws.recv()
-        return json.loads(message)
+    async def receive(self) -> Optional[Dict]:
+        """Receive message from WebSocket with error handling"""
+        try:
+            message = await self.ws.recv()
+            return json.loads(message)
+        except websockets.exceptions.ConnectionClosed:
+            print("[v0] WebSocket connection closed")
+            self.is_connected = False
+            return None
+        except Exception as e:
+            print(f"[v0] Error receiving WebSocket message: {e}")
+            return None
     
     async def close(self):
         """Close WebSocket connection"""
         if self.ws:
             await self.ws.close()
+            self.is_connected = False
             print("[v0] WebSocket connection closed")
 
 
