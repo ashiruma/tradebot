@@ -13,7 +13,9 @@ from config import (
     STOP_LOSS_PERCENT,
     MAX_CONCURRENT_TRADES,
     MAKER_FEE,
-    TAKER_FEE
+    TAKER_FEE,
+    MAX_DRAWDOWN,
+    DRAWDOWN_REDUCE_SIZE
 )
 
 
@@ -38,6 +40,11 @@ class RiskManager:
         self.total_trades = 0
         self.winning_trades = 0
         self.losing_trades = 0
+        
+        self.peak_balance = initial_balance
+        self.current_drawdown = 0.0
+        self.max_drawdown_reached = 0.0
+        self.in_drawdown = False
         
         # Safety flags
         self.trading_halted = False
@@ -73,6 +80,51 @@ class RiskManager:
         
         return True
     
+    def update_drawdown(self):
+        """Update drawdown metrics"""
+        # Update peak balance
+        if self.current_balance > self.peak_balance:
+            self.peak_balance = self.current_balance
+            self.in_drawdown = False
+        
+        # Calculate current drawdown
+        if self.peak_balance > 0:
+            self.current_drawdown = (self.peak_balance - self.current_balance) / self.peak_balance
+            
+            # Track max drawdown
+            if self.current_drawdown > self.max_drawdown_reached:
+                self.max_drawdown_reached = self.current_drawdown
+            
+            # Check if in significant drawdown
+            if self.current_drawdown > MAX_DRAWDOWN * 0.5:  # 50% of max drawdown
+                self.in_drawdown = True
+    
+    def check_drawdown_limit(self) -> bool:
+        """Check if max drawdown has been exceeded
+        
+        Returns:
+            True if trading should continue, False if halted
+        """
+        self.update_drawdown()
+        
+        if self.current_drawdown >= MAX_DRAWDOWN:
+            self.trading_halted = True
+            self.halt_reason = f"Max drawdown exceeded: {self.current_drawdown:.2%}"
+            print(f"[v0] TRADING HALTED: {self.halt_reason}")
+            return False
+        
+        return True
+    
+    def get_position_size_multiplier(self) -> float:
+        """Get position size multiplier based on drawdown
+        
+        Returns:
+            Multiplier to apply to position size (0.5 to 1.0)
+        """
+        if self.in_drawdown:
+            return DRAWDOWN_REDUCE_SIZE
+        return 1.0
+
     def can_open_position(self) -> Tuple[bool, str]:
         """Check if a new position can be opened
         
@@ -86,6 +138,9 @@ class RiskManager:
         # Check daily loss cap
         if not self.check_daily_loss_cap():
             return False, "Daily loss cap reached"
+        
+        if not self.check_drawdown_limit():
+            return False, "Max drawdown exceeded"
         
         # Check max concurrent trades
         if self.position_count >= MAX_CONCURRENT_TRADES:
@@ -123,6 +178,9 @@ class RiskManager:
         # Take the smaller of the two
         position_size_usd = min(risk_based_size_usd, max_allocation_usd)
         
+        drawdown_multiplier = self.get_position_size_multiplier()
+        position_size_usd *= drawdown_multiplier
+        
         # Calculate quantity
         quantity = position_size_usd / entry_price
         
@@ -141,29 +199,9 @@ class RiskManager:
             "max_risk_usd": max_risk_usd,
             "risk_per_unit": risk_per_unit,
             "allocation_pct": position_size_usd / self.current_balance,
-            "risk_pct": max_risk_usd / self.current_balance
+            "risk_pct": max_risk_usd / self.current_balance,
+            "drawdown_multiplier": drawdown_multiplier
         }
-    
-    def validate_position_size(self, position_size_usd: float) -> Tuple[bool, str]:
-        """Validate if position size is within limits
-        
-        Returns:
-            (is_valid, reason)
-        """
-        # Check if position size exceeds balance
-        if position_size_usd > self.current_balance:
-            return False, "Position size exceeds balance"
-        
-        # Check max allocation
-        allocation_pct = position_size_usd / self.current_balance
-        if allocation_pct > MAX_POSITION_SIZE:
-            return False, f"Position size exceeds max allocation ({MAX_POSITION_SIZE:.1%})"
-        
-        # Check minimum position size (at least $1)
-        if position_size_usd < 1.0:
-            return False, "Position size too small (min $1)"
-        
-        return True, "OK"
     
     def open_position(self, inst_id: str, entry_price: float, quantity: float, 
                      stop_loss: float, target_price: float) -> Dict:
@@ -228,6 +266,8 @@ class RiskManager:
         # Update balance
         self.current_balance += exit_value - exit_fee
         
+        self.update_drawdown()
+        
         # Update daily P&L
         self.daily_pnl += net_pnl
         
@@ -267,6 +307,7 @@ class RiskManager:
         print(f"     P&L: ${net_pnl:.2f} ({pnl_pct:+.2%})")
         print(f"     Reason: {reason}")
         print(f"     Balance: ${self.current_balance:.2f}")
+        print(f"     Drawdown: {self.current_drawdown:.2%}")
         
         return trade_result
     
@@ -297,6 +338,10 @@ class RiskManager:
         return {
             "initial_balance": self.initial_balance,
             "current_balance": self.current_balance,
+            "peak_balance": self.peak_balance,
+            "current_drawdown": self.current_drawdown,
+            "max_drawdown_reached": self.max_drawdown_reached,
+            "in_drawdown": self.in_drawdown,
             "total_pnl": total_pnl,
             "total_return_pct": total_return_pct,
             "total_trades": self.total_trades,
@@ -320,6 +365,7 @@ class RiskManager:
         print("=" * 60)
         print(f"Initial Balance:    ${stats['initial_balance']:.2f}")
         print(f"Current Balance:    ${stats['current_balance']:.2f}")
+        print(f"Peak Balance:       ${stats['peak_balance']:.2f}")
         print(f"Total P&L:          ${stats['total_pnl']:+.2f} ({stats['total_return_pct']:+.2%})")
         print(f"Daily P&L:          ${stats['daily_pnl']:+.2f} ({stats['daily_pnl_pct']:+.2%})")
         print("-" * 60)
@@ -332,8 +378,27 @@ class RiskManager:
         print("-" * 60)
         print(f"Open Positions:     {stats['open_positions']}")
         print(f"Trading Status:     {'HALTED' if stats['trading_halted'] else 'ACTIVE'}")
+        print(f"Current Drawdown:   {stats['current_drawdown']:.2%}")
+        print(f"Max Drawdown:       {stats['max_drawdown_reached']:.2%}")
         print("=" * 60 + "\n")
-
+    
+    def restore_state(self, state_data: Dict):
+        """Restore risk manager state from saved data"""
+        self.current_balance = state_data.get("current_balance", self.initial_balance)
+        self.daily_start_balance = state_data.get("daily_start_balance", self.initial_balance)
+        self.daily_pnl = state_data.get("daily_pnl", 0.0)
+        self.trading_halted = state_data.get("trading_halted", False)
+        self.halt_reason = state_data.get("halt_reason", "")
+        self.open_positions = state_data.get("open_positions", {})
+        self.position_count = len(self.open_positions)
+        
+        # Recalculate drawdown
+        self.update_drawdown()
+        
+        print(f"[v0] Risk manager state restored")
+        print(f"     Balance: ${self.current_balance:.2f}")
+        print(f"     Open positions: {self.position_count}")
+        print(f"     Drawdown: {self.current_drawdown:.2%}")
 
 if __name__ == "__main__":
     """Test risk manager"""
@@ -359,6 +424,7 @@ if __name__ == "__main__":
     print(f"   Quantity: {sizing['quantity']:.6f} BTC")
     print(f"   Max risk: ${sizing['max_risk_usd']:.2f} ({sizing['risk_pct']:.1%})")
     print(f"   Allocation: {sizing['allocation_pct']:.1%}")
+    print(f"   Drawdown Multiplier: {sizing['drawdown_multiplier']:.2f}")
     
     # Test 3: Validate position size
     print("\n3. Validating position size...")
@@ -394,6 +460,14 @@ if __name__ == "__main__":
     # Simulate a big loss
     risk_mgr.daily_pnl = -2.0  # -$2 loss on $15 balance = -13.3%
     can_continue = risk_mgr.check_daily_loss_cap()
+    print(f"   Can continue trading: {can_continue}")
+    print(f"   Trading halted: {risk_mgr.trading_halted}")
+    
+    # Test 9: Max drawdown
+    print("\n9. Testing max drawdown...")
+    # Simulate a big drawdown
+    risk_mgr.current_balance = 10.0  # $5 drawdown on $15 peak balance = -33.3%
+    can_continue = risk_mgr.check_drawdown_limit()
     print(f"   Can continue trading: {can_continue}")
     print(f"   Trading halted: {risk_mgr.trading_halted}")
     
