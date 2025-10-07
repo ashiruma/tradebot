@@ -2,15 +2,18 @@
 requests>=2.31.0
 websockets>=12.0
 
+# Environment variables
+python-dotenv>=1.0.0
+
 # Data handling
 pandas>=2.1.0
 numpy>=1.24.0
 
 # Database
-sqlite3  # Built-in with Python
+# sqlite3 is built-in with Python
 
 # Async support
-asyncio  # Built-in with Python
+# asyncio is built-in with Python
 
 # Logging
 python-json-logger>=2.0.7
