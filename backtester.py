@@ -16,7 +16,8 @@ from config import (
     LOOKBACK_PERIOD,
     PULLBACK_THRESHOLD,
     PROFIT_TARGET,
-    STOP_LOSS_PERCENT
+    STOP_LOSS_PERCENT,
+    TAKER_FEE_RATE
 )
 
 
@@ -31,6 +32,10 @@ class Backtester:
         self.trades: List[Dict] = []
         self.equity_curve: List[Dict] = []
         self.signals_generated: List[Dict] = []
+        
+        self.max_share_of_volume = 0.05  # Max 5% of bar volume
+        self.base_slippage_bps = 5  # 5 basis points base slippage
+        self.impact_coefficient = 0.1  # Price impact coefficient
         
     def fetch_historical_data(self, inst_id: str, start_date: str, end_date: str, bar: str = "1H") -> List[Dict]:
         """Fetch historical candlestick data for backtesting
@@ -125,7 +130,7 @@ class Backtester:
     
     def simulate_trade(self, signal: Dict, candles: List[Dict], entry_index: int, 
                       risk_manager: RiskManager) -> Dict:
-        """Simulate a trade from entry to exit
+        """Simulate a trade from entry to exit with realistic fill model
         
         Returns:
             Trade result dict
@@ -142,33 +147,72 @@ class Backtester:
         if not is_valid:
             return {"status": "SKIPPED", "reason": reason}
         
+        entry_candle = candles[entry_index]
+        entry_volume = entry_candle["volume"]
+        
+        # Check if order size exceeds volume limit
+        max_order_size = entry_volume * self.max_share_of_volume
+        order_size_base = sizing["adjusted_quantity"]
+        
+        if order_size_base > max_order_size:
+            # Partial fill or skip
+            print(f"[v0] Order size {order_size_base:.6f} exceeds max {max_order_size:.6f}, using partial fill")
+            order_size_base = max_order_size
+            if order_size_base < sizing["adjusted_quantity"] * 0.5:
+                # Less than 50% filled, skip trade
+                return {"status": "SKIPPED", "reason": "Insufficient volume for entry"}
+        
+        # Calculate slippage
+        volume_ratio = order_size_base / entry_volume
+        slippage_bps = self.base_slippage_bps + (volume_ratio * self.impact_coefficient * 10000)
+        slippage_pct = slippage_bps / 10000
+        
+        # Apply slippage to entry (worse price for buyer)
+        actual_entry_price = entry_price * (1 + slippage_pct)
+        
+        # Calculate entry fee
+        entry_fee = actual_entry_price * order_size_base * TAKER_FEE_RATE
+        
+        if entry_index + 1 >= len(candles):
+            return {"status": "SKIPPED", "reason": "End of data"}
+        
+        next_candle = candles[entry_index + 1]
+        # Entry happens at open of next bar (simulating latency)
+        actual_entry_price = next_candle["open"] * (1 + slippage_pct)
+        
+        # Recalculate stop loss and target based on actual entry
+        price_diff_pct = (actual_entry_price - entry_price) / entry_price
+        adjusted_stop_loss = stop_loss * (1 + price_diff_pct)
+        adjusted_target = target_price * (1 + price_diff_pct)
+        
         # Open position
         position = risk_manager.open_position(
             "BACKTEST",
-            entry_price,
-            sizing["adjusted_quantity"],
-            stop_loss,
-            target_price
+            actual_entry_price,
+            order_size_base,
+            adjusted_stop_loss,
+            adjusted_target
         )
         
         # Simulate forward through candles to find exit
         exit_price = None
         exit_reason = None
         exit_index = None
+        partial_fill = False
         
-        for i in range(entry_index + 1, len(candles)):
+        for i in range(entry_index + 2, len(candles)):  # Start from bar after entry
             candle = candles[i]
             
             # Check if stop loss hit
-            if candle["low"] <= stop_loss:
-                exit_price = stop_loss
+            if candle["low"] <= adjusted_stop_loss:
+                exit_price = adjusted_stop_loss
                 exit_reason = "STOP_LOSS"
                 exit_index = i
                 break
             
             # Check if target hit
-            if candle["high"] >= target_price:
-                exit_price = target_price
+            if candle["high"] >= adjusted_target:
+                exit_price = adjusted_target
                 exit_reason = "PROFIT_TARGET"
                 exit_index = i
                 break
@@ -179,11 +223,30 @@ class Backtester:
             exit_reason = "END_OF_DATA"
             exit_index = len(candles) - 1
         
-        # Close position
-        trade_result = risk_manager.close_position("BACKTEST", exit_price, exit_reason)
+        exit_candle = candles[exit_index]
+        exit_volume = exit_candle["volume"]
+        exit_volume_ratio = order_size_base / exit_volume
+        exit_slippage_bps = self.base_slippage_bps + (exit_volume_ratio * self.impact_coefficient * 10000)
+        exit_slippage_pct = exit_slippage_bps / 10000
+        
+        # Apply slippage to exit (worse price for seller)
+        actual_exit_price = exit_price * (1 - exit_slippage_pct)
+        
+        # Calculate exit fee
+        exit_fee = actual_exit_price * order_size_base * TAKER_FEE_RATE
+        
+        # Close position with realistic prices
+        trade_result = risk_manager.close_position("BACKTEST", actual_exit_price, exit_reason)
+        
+        trade_result["entry_fee"] = entry_fee
+        trade_result["exit_fee"] = exit_fee
+        trade_result["total_fees"] = entry_fee + exit_fee
+        trade_result["entry_slippage_pct"] = slippage_pct
+        trade_result["exit_slippage_pct"] = exit_slippage_pct
         trade_result["entry_timestamp"] = signal["timestamp"]
         trade_result["exit_timestamp"] = candles[exit_index]["datetime"]
         trade_result["bars_held"] = exit_index - entry_index
+        trade_result["partial_fill"] = partial_fill
         
         return trade_result
     
