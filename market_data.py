@@ -32,6 +32,10 @@ class MarketDataManager:
         # Track data freshness
         self.last_update: Dict[str, float] = {}
         
+        self.orderbook_snapshots: Dict[str, Dict] = {}
+        self.orderbook_sequences: Dict[str, int] = {}
+        self.snapshot_fetched: Dict[str, bool] = {}
+        
     async def initialize(self):
         """Initialize WebSocket connection and subscribe to data feeds"""
         self.ws = OKXWebSocket()
@@ -40,9 +44,32 @@ class MarketDataManager:
         # Subscribe to tickers for all trading pairs
         for pair in TRADING_PAIRS:
             await self.ws.subscribe("tickers", pair)
+            await self.ws.subscribe("books", pair)
             await asyncio.sleep(0.1)  # Avoid rate limits
         
         print(f"[v0] Subscribed to {len(TRADING_PAIRS)} trading pairs")
+        
+        await self._fetch_orderbook_snapshots()
+    
+    async def _fetch_orderbook_snapshots(self):
+        """Fetch REST orderbook snapshots for all pairs"""
+        print("[v0] Fetching orderbook snapshots...")
+        for pair in TRADING_PAIRS:
+            try:
+                response = self.client.get_orderbook(pair, depth=20)
+                if response.get("code") == "0" and response.get("data"):
+                    book_data = response["data"][0]
+                    self.orderbook_snapshots[pair] = {
+                        "bids": book_data.get("bids", []),
+                        "asks": book_data.get("asks", []),
+                        "timestamp": int(book_data.get("ts", 0))
+                    }
+                    self.orderbook_sequences[pair] = int(book_data.get("seqId", 0))
+                    self.snapshot_fetched[pair] = True
+                    print(f"[v0] Snapshot fetched for {pair} (seq: {self.orderbook_sequences[pair]})")
+            except Exception as e:
+                print(f"[v0] Error fetching snapshot for {pair}: {e}")
+                self.snapshot_fetched[pair] = False
     
     async def start_data_stream(self, callback):
         """Start receiving real-time market data
@@ -52,7 +79,20 @@ class MarketDataManager:
         """
         while True:
             try:
+                if not self.ws.is_connection_healthy():
+                    print("[v0] WebSocket connection unhealthy, reconnecting...")
+                    await self.ws.connect()
+                    await self._fetch_orderbook_snapshots()
+                    continue
+                
                 message = await self.ws.receive()
+                
+                if message is None:
+                    # Connection closed, reconnect
+                    print("[v0] Connection closed, reconnecting...")
+                    await self.ws.connect()
+                    await self._fetch_orderbook_snapshots()
+                    continue
                 
                 # Handle different message types
                 if "event" in message:
@@ -72,10 +112,57 @@ class MarketDataManager:
                         
                         # Call callback with updated data
                         await callback(inst_id, "ticker", data)
+                    
+                    elif channel == "books":
+                        await self._handle_orderbook_update(inst_id, data)
                         
             except Exception as e:
                 print(f"[v0] WebSocket error: {e}")
                 await asyncio.sleep(1)
+    
+    async def _handle_orderbook_update(self, inst_id: str, data: Dict):
+        """Handle orderbook update with sequence validation
+        
+        Implements snapshot + delta pattern:
+        1. Fetch REST snapshot on connect
+        2. Apply deltas where delta.seq > snapshot.seq
+        3. Discard out-of-order deltas
+        """
+        if not self.snapshot_fetched.get(inst_id, False):
+            print(f"[v0] No snapshot for {inst_id}, skipping delta")
+            return
+        
+        # Get sequence number from update
+        update_seq = int(data.get("seqId", 0))
+        current_seq = self.orderbook_sequences.get(inst_id, 0)
+        
+        if update_seq <= current_seq:
+            # Out of order or duplicate, discard
+            print(f"[v0] Discarding out-of-order update for {inst_id} (seq {update_seq} <= {current_seq})")
+            return
+        
+        # Check for gap in sequence
+        if update_seq > current_seq + 1:
+            print(f"[v0] Sequence gap detected for {inst_id} ({current_seq} -> {update_seq}), refetching snapshot")
+            # Refetch snapshot
+            response = self.client.get_orderbook(inst_id, depth=20)
+            if response.get("code") == "0" and response.get("data"):
+                book_data = response["data"][0]
+                self.orderbook_snapshots[inst_id] = {
+                    "bids": book_data.get("bids", []),
+                    "asks": book_data.get("asks", []),
+                    "timestamp": int(book_data.get("ts", 0))
+                }
+                self.orderbook_sequences[inst_id] = int(book_data.get("seqId", 0))
+            return
+        
+        # Apply delta update
+        self.orderbook_snapshots[inst_id] = {
+            "bids": data.get("bids", []),
+            "asks": data.get("asks", []),
+            "timestamp": int(data.get("ts", 0))
+        }
+        self.orderbook_sequences[inst_id] = update_seq
     
     def get_historical_candles(self, inst_id: str, bar: str = "1H", limit: int = 100) -> List[Dict]:
         """Fetch historical candlestick data
@@ -138,6 +225,18 @@ class MarketDataManager:
         Returns:
             (spread_percent, mid_price)
         """
+        if inst_id in self.orderbook_snapshots:
+            book = self.orderbook_snapshots[inst_id]
+            if book.get("bids") and book.get("asks"):
+                best_bid = float(book["bids"][0][0])
+                best_ask = float(book["asks"][0][0])
+                
+                mid_price = (best_bid + best_ask) / 2
+                spread_percent = (best_ask - best_bid) / mid_price
+                
+                return spread_percent, mid_price
+        
+        # Fallback to REST API
         response = self.client.get_orderbook(inst_id, depth=1)
         
         if response.get("code") != "0" or not response.get("data"):
