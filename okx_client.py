@@ -29,6 +29,16 @@ from config import (
 )
 
 
+class ExchangeTransientError(Exception):
+    """Transient errors that should be retried (rate limits, timeouts, server errors)"""
+    pass
+
+
+class ExchangePermanentError(Exception):
+    """Permanent errors that should not be retried (invalid params, insufficient balance)"""
+    pass
+
+
 class OKXClient:
     """OKX API Client with rate limiting and authentication"""
     
@@ -108,49 +118,91 @@ class OKXClient:
                 response.raise_for_status()
                 result = response.json()
                 
-                # Check OKX API error codes
                 if result.get("code") != "0":
+                    error_code = result.get("code")
                     error_msg = result.get("msg", "Unknown error")
-                    print(f"[v0] OKX API error: {error_msg}")
                     
-                    # Don't retry certain errors (invalid params, insufficient balance, etc.)
-                    non_retryable_codes = ["51000", "51001", "51008", "51020"]
-                    if result.get("code") in non_retryable_codes:
-                        return result
+                    # Permanent errors (don't retry)
+                    permanent_codes = [
+                        "51000",  # Parameter error
+                        "51001",  # Instrument ID does not exist
+                        "51008",  # Order amount exceeds limit
+                        "51020",  # Order price/size does not meet requirements
+                        "51119",  # Insufficient balance
+                        "51121",  # Order size less than minimum
+                        "51400",  # Cancellation failed (order already filled/canceled)
+                    ]
                     
-                    # Retry for other errors
-                    last_error = error_msg
-                    if attempt < MAX_API_RETRIES - 1:
-                        print(f"[v0] Retrying in {RETRY_DELAY}s... (attempt {attempt + 1}/{MAX_API_RETRIES})")
-                        time.sleep(RETRY_DELAY)
-                        continue
+                    # Transient errors (retry)
+                    transient_codes = [
+                        "50011",  # Rate limit
+                        "50013",  # System busy
+                        "50014",  # Request timeout
+                        "50024",  # Too many requests
+                        "50026",  # System maintenance
+                    ]
+                    
+                    if error_code in permanent_codes:
+                        print(f"[v0] Permanent error: {error_msg}")
+                        raise ExchangePermanentError(f"{error_code}: {error_msg}")
+                    elif error_code in transient_codes:
+                        print(f"[v0] Transient error: {error_msg}")
+                        if attempt < MAX_API_RETRIES - 1:
+                            # Exponential backoff
+                            backoff = min(0.5 * (2 ** attempt), 8.0)
+                            print(f"[v0] Retrying in {backoff}s... (attempt {attempt + 1}/{MAX_API_RETRIES})")
+                            time.sleep(backoff)
+                            continue
+                        raise ExchangeTransientError(f"{error_code}: {error_msg}")
+                    else:
+                        # Unknown error, treat as transient
+                        print(f"[v0] Unknown error code {error_code}: {error_msg}")
+                        if attempt < MAX_API_RETRIES - 1:
+                            backoff = min(0.5 * (2 ** attempt), 8.0)
+                            time.sleep(backoff)
+                            continue
+                        raise ExchangeTransientError(f"{error_code}: {error_msg}")
                 
                 return result
                 
+            except (ExchangePermanentError, ExchangeTransientError):
+                raise
             except requests.exceptions.Timeout as e:
                 last_error = f"Request timeout: {e}"
                 print(f"[v0] {last_error}")
+                if attempt < MAX_API_RETRIES - 1:
+                    backoff = min(0.5 * (2 ** attempt), 8.0)
+                    print(f"[v0] Retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    continue
                 
             except requests.exceptions.ConnectionError as e:
                 last_error = f"Connection error: {e}"
                 print(f"[v0] {last_error}")
+                if attempt < MAX_API_RETRIES - 1:
+                    backoff = min(0.5 * (2 ** attempt), 8.0)
+                    time.sleep(backoff)
+                    continue
                 
             except requests.exceptions.HTTPError as e:
                 last_error = f"HTTP error: {e}"
                 print(f"[v0] {last_error}")
+                if attempt < MAX_API_RETRIES - 1:
+                    backoff = min(0.5 * (2 ** attempt), 8.0)
+                    time.sleep(backoff)
+                    continue
                 
             except Exception as e:
                 last_error = f"Unexpected error: {e}"
                 print(f"[v0] {last_error}")
-            
-            # Wait before retry
-            if attempt < MAX_API_RETRIES - 1:
-                print(f"[v0] Retrying in {RETRY_DELAY}s... (attempt {attempt + 1}/{MAX_API_RETRIES})")
-                time.sleep(RETRY_DELAY)
+                if attempt < MAX_API_RETRIES - 1:
+                    backoff = min(0.5 * (2 ** attempt), 8.0)
+                    time.sleep(backoff)
+                    continue
         
         # All retries failed
         print(f"[v0] API request failed after {MAX_API_RETRIES} attempts: {last_error}")
-        return {"code": "error", "msg": last_error}
+        raise ExchangeTransientError(f"Max retries exceeded: {last_error}")
     
     # ========================================================================
     # MARKET DATA ENDPOINTS
@@ -285,11 +337,63 @@ class OKXClient:
         }
         return self._request("GET", endpoint, params=params)
     
-    def get_instruments(self, inst_type: str = "SPOT") -> Dict:
+    def get_instruments(self, inst_type: str = "SPOT", inst_id: Optional[str] = None) -> Dict:
         """Get available trading instruments"""
         endpoint = "/api/v5/public/instruments"
         params = {"instType": inst_type}
+        if inst_id:
+            params["instId"] = inst_id
         return self._request("GET", endpoint, params=params)
+    
+    def get_recent_trades(self, inst_type: str = "SPOT", since_timestamp: Optional[int] = None) -> Dict:
+        """Get recent filled trades for reconciliation
+        
+        Args:
+            inst_type: Instrument type (SPOT, MARGIN, etc.)
+            since_timestamp: Unix timestamp in milliseconds
+        
+        Returns:
+            Recent trades
+        """
+        endpoint = "/api/v5/trade/fills-history"
+        params = {"instType": inst_type}
+        if since_timestamp:
+            params["after"] = str(since_timestamp)
+        return self._request("GET", endpoint, params=params)
+    
+    def get_instrument_rules(self, inst_id: str) -> Dict:
+        """Get instrument trading rules (tick size, min size, precision)
+        
+        Returns:
+            {
+                'tick_size': float,
+                'min_size': float,
+                'price_precision': int,
+                'size_precision': int
+            }
+        """
+        try:
+            response = self.get_instruments("SPOT", inst_id)
+            if response.get("code") == "0" and response.get("data"):
+                inst_data = response["data"][0]
+                return {
+                    'tick_size': float(inst_data.get("tickSz", "0.01")),
+                    'min_size': float(inst_data.get("minSz", "0.00001")),
+                    'price_precision': len(inst_data.get("tickSz", "0.01").split('.')[-1]),
+                    'size_precision': len(inst_data.get("lotSz", "0.00001").split('.')[-1]),
+                    'lot_size': float(inst_data.get("lotSz", "0.00001"))
+                }
+        except Exception as e:
+            print(f"[v0] Error getting instrument rules: {e}")
+        
+        # Return defaults
+        return {
+            'tick_size': 0.01,
+            'min_size': 0.00001,
+            'price_precision': 2,
+            'size_precision': 6,
+            'lot_size': 0.00001
+        }
 
 
 class OKXWebSocket:
@@ -301,6 +405,10 @@ class OKXWebSocket:
         self.subscriptions = []
         self.reconnect_attempts = 0
         self.is_connected = False
+        
+        self.last_message_time = 0
+        self.heartbeat_timeout = 30  # seconds
+        self.sequence_numbers = {}  # Track sequence numbers per channel
         
     async def connect(self):
         """Establish WebSocket connection with retry logic"""
@@ -358,6 +466,7 @@ class OKXWebSocket:
         """Receive message from WebSocket with error handling"""
         try:
             message = await self.ws.recv()
+            self.last_message_time = time.time()
             return json.loads(message)
         except websockets.exceptions.ConnectionClosed:
             print("[v0] WebSocket connection closed")
@@ -366,6 +475,17 @@ class OKXWebSocket:
         except Exception as e:
             print(f"[v0] Error receiving WebSocket message: {e}")
             return None
+    
+    def is_connection_healthy(self) -> bool:
+        """Check if connection is healthy based on last message time"""
+        if not self.is_connected:
+            return False
+        
+        if self.last_message_time == 0:
+            return True  # Just connected
+        
+        time_since_last_message = time.time() - self.last_message_time
+        return time_since_last_message < self.heartbeat_timeout
     
     async def close(self):
         """Close WebSocket connection"""
