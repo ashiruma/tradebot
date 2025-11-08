@@ -1,259 +1,242 @@
 """
-Trading Strategy - Pullback detection and signal generation
-Identifies 3% pullbacks from recent highs and generates buy signals
+Trading Strategy - EMA + RSI + Pullback signal generation
+Realistic signal generation for spot:
+ - Uses EMA cross + RSI filter
+ - Pullback from recent high confirmation
+ - Volume and spread liquidity checks via MarketDataManager
+ - Outputs scored signals so the bot can rank/select opportunities
 """
 
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+import math
+
 from market_data import MarketDataManager
 from config import (
     PULLBACK_THRESHOLD,
     PROFIT_TARGET,
-    STOP_LOSS_PERCENT,
+    STOP_LOSS,            # alias available in config
     LOOKBACK_PERIOD,
-    TRADING_PAIRS
+    TRADING_PAIRS,
+    MIN_24H_VOLUME,
+    MIN_SPREAD_PERCENT
 )
 
+def ema(series: List[float], period: int) -> List[float]:
+    """Compute exponential moving average; returns list same length (first values are simple SMA until filled)."""
+    if not series or period <= 0:
+        return []
+    emas = []
+    k = 2 / (period + 1)
+    sma = sum(series[:period]) / period if len(series) >= period else sum(series) / max(1, len(series))
+    emas = [sma] * len(series)
+    current = sma
+    for i in range(period, len(series)):
+        current = (series[i] - current) * k + current
+        emas[i] = current
+    return emas
+
+def rsi(series: List[float], period: int = 14) -> List[float]:
+    """Compute RSI values for a price series. Returns list same length (earlier indices filled with 50)."""
+    if not series or period <= 0:
+        return []
+    gains = []
+    losses = []
+    rsis = [50.0] * len(series)
+    for i in range(1, len(series)):
+        change = series[i] - series[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+        if i >= period:
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+            if avg_loss == 0:
+                rsis[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsis[i] = 100 - (100 / (1 + rs))
+    return rsis
 
 class TradingStrategy:
-    """Pullback/retracement trading strategy"""
-    
+    """
+    Composite trading strategy:
+      - EMA trend filter (short vs long)
+      - RSI for momentum (avoid buying into overbought)
+      - Pullback-from-recent-high detection for entry
+      - Liquidity checks using MarketDataManager
+    """
+
     def __init__(self, market_data: MarketDataManager):
         self.market_data = market_data
-        
-        # Track signals and state
         self.active_signals: Dict[str, Dict] = {}
         self.signal_history: List[Dict] = []
-        
+
+        # Parameters for indicators
+        self.ema_short_period = 12
+        self.ema_long_period = 26
+        self.rsi_period = 14
+
+    def _prepare_price_series(self, inst_id: str, bar: str = "1H", limit: int = 200) -> List[float]:
+        """Fetch candles and return closing price series (oldest->newest)"""
+        candles = self.market_data.get_historical_candles(inst_id, bar=bar, limit=limit)
+        if not candles:
+            return []
+        closes = [c["close"] for c in candles]  # stored oldest->newest
+        return closes
+
+    def _liquidity_ok(self, inst_id: str) -> bool:
+        """Use MarketDataManager checks for volume and spread"""
+        try:
+            volume = self.market_data.get_24h_volume(inst_id)
+            if volume < MIN_24H_VOLUME:
+                return False
+            spread, _ = self.market_data.get_spread(inst_id)
+            if spread > MIN_SPREAD_PERCENT:
+                return False
+            return True
+        except Exception:
+            return False
+
     def calculate_pullback_percent(self, current_price: float, recent_high: float) -> float:
-        """Calculate pullback percentage from recent high
-        
-        Returns:
-            Negative percentage if price is below high (e.g., -0.03 for 3% pullback)
-        """
+        """Return negative if price below recent high (e.g., -0.03 for 3% pullback)"""
         if recent_high == 0:
             return 0.0
-        
         return (current_price - recent_high) / recent_high
-    
-    def detect_pullback(self, inst_id: str) -> Optional[Dict]:
-        """Detect if a pullback opportunity exists
-        
-        Returns:
-            Signal dict if pullback detected, None otherwise
+
+    def detect_pullback_signal(self, inst_id: str) -> Optional[Dict]:
         """
-        # Get current price
+        Detect pullback signals with indicator confirmation.
+        Returns a signal dict or None.
+        """
+        # liquidity first
+        if not self._liquidity_ok(inst_id):
+            return None
+
         current_price = self.market_data.get_current_price(inst_id)
-        if not current_price:
+        if not current_price or current_price <= 0:
             return None
-        
-        # Get recent high
-        recent_high = self.market_data.get_recent_high(inst_id, LOOKBACK_PERIOD)
-        if not recent_high:
+
+        # Build price series
+        prices = self._prepare_price_series(inst_id, bar="1H", limit=max(LOOKBACK_PERIOD * 4, 100))
+        if not prices or len(prices) < max(self.ema_long_period + 5, self.rsi_period + 5):
             return None
-        
-        # Calculate pullback
+
+        # Indicators
+        emas_short = ema(prices, self.ema_short_period)
+        emas_long = ema(prices, self.ema_long_period)
+        rsis = rsi(prices, self.rsi_period)
+
+        latest_idx = len(prices) - 1
+        ema_short_val = emas_short[latest_idx]
+        ema_long_val = emas_long[latest_idx]
+        rsi_val = rsis[latest_idx] if latest_idx < len(rsis) else 50.0
+
+        trend_bull = ema_short_val > ema_long_val
+
+        recent_high = max(prices[-LOOKBACK_PERIOD:]) if LOOKBACK_PERIOD <= len(prices) else max(prices)
         pullback_pct = self.calculate_pullback_percent(current_price, recent_high)
-        
-        # Check if pullback threshold is met (negative percentage)
-        if pullback_pct <= -PULLBACK_THRESHOLD:
-            # Pullback detected!
+
+        if pullback_pct <= -PULLBACK_THRESHOLD and trend_bull and rsi_val < 70:
+            score = 0.0
+            score += min(abs(pullback_pct) / 0.05, 1.0) * 0.6
+            ema_sep = abs(ema_short_val - ema_long_val) / max(ema_long_val, 1e-8)
+            score += min(ema_sep / 0.02, 1.0) * 0.25
+            if 40 <= rsi_val <= 60:
+                score += 0.15
+            elif rsi_val < 40:
+                score += 0.05
             signal = {
                 "inst_id": inst_id,
                 "signal_type": "BUY",
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.utcnow().isoformat(),
                 "current_price": current_price,
                 "recent_high": recent_high,
                 "pullback_percent": pullback_pct,
                 "entry_price": current_price,
                 "target_price": current_price * (1 + PROFIT_TARGET),
-                "stop_loss": current_price * (1 - STOP_LOSS_PERCENT),
-                "reason": f"Pullback of {abs(pullback_pct):.2%} from recent high"
+                "stop_loss": current_price * (1 - STOP_LOSS),
+                "rsi": rsi_val,
+                "ema_short": ema_short_val,
+                "ema_long": ema_long_val,
+                "score": round(score, 4),
+                "reason": f"Pullback {abs(pullback_pct):.2%} from high, EMA trend bullish, RSI {rsi_val:.1f}"
             }
-            
             return signal
-        
         return None
-    
-    def check_exit_conditions(self, inst_id: str, entry_price: float, target_price: float, stop_loss: float) -> Tuple[bool, str]:
-        """Check if exit conditions are met for an open position
-        
-        Returns:
-            (should_exit, reason)
-        """
-        current_price = self.market_data.get_current_price(inst_id)
-        if not current_price:
-            return False, ""
-        
-        # Check profit target
-        if current_price >= target_price:
-            profit_pct = (current_price - entry_price) / entry_price
-            return True, f"PROFIT_TARGET: {profit_pct:.2%} gain"
-        
-        # Check stop loss
-        if current_price <= stop_loss:
-            loss_pct = (current_price - entry_price) / entry_price
-            return True, f"STOP_LOSS: {loss_pct:.2%} loss"
-        
-        return False, ""
-    
+
     def scan_all_pairs(self) -> List[Dict]:
-        """Scan all trading pairs for pullback opportunities
-        
-        Returns:
-            List of buy signals
-        """
-        signals = []
-        
-        for inst_id in TRADING_PAIRS:
-            # Check liquidity first
-            if not self.market_data.check_liquidity(inst_id):
-                continue
-            
-            # Detect pullback
-            signal = self.detect_pullback(inst_id)
-            if signal:
-                signals.append(signal)
-                print(f"[v0] SIGNAL: {inst_id} - {signal['reason']}")
-                print(f"     Entry: ${signal['entry_price']:,.2f}")
-                print(f"     Target: ${signal['target_price']:,.2f} (+{PROFIT_TARGET:.1%})")
-                print(f"     Stop: ${signal['stop_loss']:,.2f} (-{STOP_LOSS_PERCENT:.1%})")
-        
+        """Scan all configured pairs and return valid signals (scored)"""
+        signals: List[Dict] = []
+        for inst in TRADING_PAIRS:
+            try:
+                sig = self.detect_pullback_signal(inst)
+                if sig:
+                    signals.append(sig)
+                    print(f"[v0] SIGNAL: {inst} - Pullback of {abs(sig['pullback_percent']):.2%} from recent high")
+                    print(f"     Entry: ${sig['entry_price']:,.2f} | Target: ${sig['target_price']:,.2f} | Stop: ${sig['stop_loss']:,.2f} | Score: {sig['score']}")
+            except Exception as e:
+                print(f"[v0] Error scanning {inst}: {e}")
         return signals
-    
+
     def rank_signals(self, signals: List[Dict]) -> List[Dict]:
-        """Rank signals by strength (largest pullback = strongest signal)
-        
-        Returns:
-            Sorted list of signals (best first)
-        """
-        if not signals:
-            return []
-        
-        # Sort by pullback percentage (most negative = strongest)
-        ranked = sorted(signals, key=lambda x: x["pullback_percent"])
-        
-        return ranked
-    
+        """Sort signals by combined score (descending)"""
+        return sorted(signals, key=lambda x: x.get("score", 0), reverse=True)
+
     def get_best_signal(self) -> Optional[Dict]:
-        """Get the best trading signal from current market scan
-        
-        Returns:
-            Best signal dict or None
-        """
+        """Return the top-ranked signal (if any), store it as active"""
         signals = self.scan_all_pairs()
-        
         if not signals:
             return None
-        
-        ranked_signals = self.rank_signals(signals)
-        best_signal = ranked_signals[0]
-        
-        # Store in active signals
-        self.active_signals[best_signal["inst_id"]] = best_signal
-        self.signal_history.append(best_signal)
-        
-        return best_signal
-    
+        ranked = self.rank_signals(signals)
+        best = ranked[0]
+        self.active_signals[best["inst_id"]] = best
+        self.signal_history.append(best)
+        return best
+
     def calculate_position_metrics(self, signal: Dict, position_size_usd: float) -> Dict:
-        """Calculate detailed position metrics
-        
-        Args:
-            signal: Trading signal
-            position_size_usd: Position size in USD
-        
-        Returns:
-            Dict with position metrics
-        """
+        """Return quantity, risk/reward etc. Uses entry/stop/target from signal."""
         entry_price = signal["entry_price"]
-        target_price = signal["target_price"]
-        stop_loss = signal["stop_loss"]
-        
-        # Calculate quantities
-        quantity = position_size_usd / entry_price
-        
-        # Calculate potential outcomes
-        profit_usd = (target_price - entry_price) * quantity
-        loss_usd = (entry_price - stop_loss) * quantity
-        
-        # Risk/reward ratio
-        risk_reward = abs(profit_usd / loss_usd) if loss_usd > 0 else 0
-        
+        stop = signal["stop_loss"]
+        target = signal["target_price"]
+        quantity = position_size_usd / entry_price if entry_price > 0 else 0.0
+        potential_profit = max(0.0, (target - entry_price) * quantity)
+        potential_loss = max(0.0, (entry_price - stop) * quantity)
+        risk_reward = potential_profit / potential_loss if potential_loss > 0 else math.inf
         return {
-            "position_size_usd": position_size_usd,
             "quantity": quantity,
-            "entry_price": entry_price,
-            "target_price": target_price,
-            "stop_loss": stop_loss,
-            "potential_profit_usd": profit_usd,
-            "potential_loss_usd": loss_usd,
-            "risk_reward_ratio": risk_reward,
-            "profit_target_pct": PROFIT_TARGET,
-            "stop_loss_pct": STOP_LOSS_PERCENT
+            "position_size_usd": position_size_usd,
+            "potential_profit_usd": potential_profit,
+            "potential_loss_usd": potential_loss,
+            "risk_reward_ratio": risk_reward
         }
-    
+
     def get_signal_summary(self) -> Dict:
-        """Get summary of signal history and performance"""
         return {
             "total_signals": len(self.signal_history),
             "active_signals": len(self.active_signals),
-            "signal_history": self.signal_history[-10:]  # Last 10 signals
+            "recent_signals": self.signal_history[-10:]
         }
 
+# -----------------------
+# Backwards-compatible wrapper
+# -----------------------
+class Strategy:
+    """
+    Simple wrapper used by older code expecting Strategy() without args.
+    If passed a MarketDataManager instance at creation, uses the more realistic TradingStrategy.
+    """
 
-if __name__ == "__main__":
-    """Test trading strategy"""
-    import asyncio
-    
-    async def main():
-        print("Testing Trading Strategy...")
-        print("=" * 60)
-        
-        # Initialize market data
-        market_data = MarketDataManager()
-        
-        # Initialize strategy
-        strategy = TradingStrategy(market_data)
-        
-        # Test 1: Scan for signals
-        print("\n1. Scanning all pairs for pullback signals...")
-        signals = strategy.scan_all_pairs()
-        
-        if signals:
-            print(f"\n   Found {len(signals)} signals!")
-            for signal in signals:
-                print(f"\n   {signal['inst_id']}:")
-                print(f"   - Pullback: {abs(signal['pullback_percent']):.2%}")
-                print(f"   - Entry: ${signal['entry_price']:,.2f}")
-                print(f"   - Target: ${signal['target_price']:,.2f}")
+    def __init__(self, market_data: Optional[MarketDataManager] = None):
+        if market_data is None:
+            self.market_data = MarketDataManager()
         else:
-            print("   No signals found at this time")
-        
-        # Test 2: Get best signal
-        print("\n2. Getting best signal...")
-        best_signal = strategy.get_best_signal()
-        
-        if best_signal:
-            print(f"   Best opportunity: {best_signal['inst_id']}")
-            print(f"   Pullback: {abs(best_signal['pullback_percent']):.2%}")
-            
-            # Test 3: Calculate position metrics
-            print("\n3. Calculating position metrics for $7.50 position...")
-            metrics = strategy.calculate_position_metrics(best_signal, 7.50)
-            print(f"   Quantity: {metrics['quantity']:.6f}")
-            print(f"   Potential profit: ${metrics['potential_profit_usd']:.2f}")
-            print(f"   Potential loss: ${metrics['potential_loss_usd']:.2f}")
-            print(f"   Risk/Reward: {metrics['risk_reward_ratio']:.2f}")
-        else:
-            print("   No signals available")
-        
-        # Test 4: Signal summary
-        print("\n4. Signal summary...")
-        summary = strategy.get_signal_summary()
-        print(f"   Total signals generated: {summary['total_signals']}")
-        print(f"   Active signals: {summary['active_signals']}")
-        
-        print("\n" + "=" * 60)
-        print("Trading Strategy test complete!")
-    
-    asyncio.run(main())
+            self.market_data = market_data
+        self._impl = TradingStrategy(self.market_data)
+
+    def generate_signal(self, market_snapshot: Dict[str, Dict]) -> Optional[Dict]:
+        """
+        Generate signal based on latest market snapshot (simple integration point).
+        The realistic detector reads candles itself, but this wrapper uses the detector flow.
+        """
+        # Try to return best signal from live detector
+        return self._impl.get_best_signal()

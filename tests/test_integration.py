@@ -3,8 +3,10 @@ Integration Tests - Verify critical bot functionality before live trading
 Run these tests to ensure the bot is production-ready
 """
 
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import unittest
-import os
 import tempfile
 import json
 from datetime import datetime
@@ -13,6 +15,8 @@ from state_manager import StateManager
 from database import DatabaseManager
 from risk_manager import RiskManager
 from okx_client import OKXClient, ExchangeTransientError, ExchangePermanentError
+
+
 
 
 class TestOrderIdempotency(unittest.TestCase):
